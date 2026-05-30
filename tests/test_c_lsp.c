@@ -20,6 +20,8 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ── Helpers (same as test_go_lsp.c) ───────────────────────────── */
 
@@ -578,6 +580,38 @@ TEST(clsp_nocrash_template_function_multi_param_nested_call) {
     ASSERT_GTE(find_resolved(r, "f", "right_aligned_text"), 0);
     ASSERT_GTE(find_resolved(r, "f", "format_units"), 0);
     cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #355: indexing segfaulted while extracting a heavily-macro'd xxhash
+ * C header (`dhw/xx_hash.h`). The reporter's exact file isn't available, so
+ * this drives the vendored xxhash.h (~7.5k lines, same macro-dense family)
+ * through C extraction as a proxy/regression guard. Runs under ASan. */
+TEST(clsp_nocrash_issue355_xxhash_header) {
+    FILE *fp = fopen("vendored/xxhash/xxhash.h", "rb");
+    if (!fp) {
+        SKIP("vendored/xxhash/xxhash.h not found (run from repo root)");
+    }
+    fseek(fp, 0, SEEK_END);
+    long n = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (n <= 0) {
+        fclose(fp);
+        SKIP("xxhash.h unreadable");
+    }
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) {
+        fclose(fp);
+        SKIP("oom");
+    }
+    size_t rd = fread(buf, 1, (size_t)n, fp);
+    fclose(fp);
+    buf[rd] = '\0';
+    CBMFileResult *r =
+        cbm_extract_file(buf, (int)rd, CBM_LANG_C, "test", "xxhash.h", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    free(buf);
     PASS();
 }
 
@@ -15162,6 +15196,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_nocrash_template_expression);
     RUN_TEST(clsp_nocrash_template_extra_call_args);
     RUN_TEST(clsp_nocrash_template_function_multi_param_nested_call);
+    RUN_TEST(clsp_nocrash_issue355_xxhash_header);
     RUN_TEST(clsp_nocrash_issue312_default_template_auto_param);
     RUN_TEST(clsp_nocrash_lambda);
     RUN_TEST(clsp_nocrash_nested_namespace);
