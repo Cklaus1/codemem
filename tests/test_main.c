@@ -78,6 +78,8 @@ extern void suite_security(void);
 extern void suite_yaml(void);
 extern void suite_integration(void);
 extern void suite_lang_contract(void);
+extern void suite_edge_imports(void);
+extern void suite_edge_structural(void);
 extern void suite_incremental(void);
 extern void suite_simhash(void);
 extern void suite_stack_overflow(void);
@@ -213,6 +215,8 @@ int main(void) {
 
     /* Per-language graph contracts (node/edge types, attribution, no-crash) */
     RUN_SUITE(lang_contract);
+    RUN_SUITE(edge_imports);
+    RUN_SUITE(edge_structural);
 
     RUN_SUITE(incremental);
 
