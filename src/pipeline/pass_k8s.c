@@ -240,11 +240,11 @@ static void k8s_add_val(char dst[][K8S_LABEL_LEN], int *n, const char *v) {
  * indentation path-stack distinguishes spec.selector from
  * spec.template.metadata.labels and from top-level metadata.name. */
 static void k8s_scan_labels(const char *source, k8s_record_t *rec) {
-    enum { PATH_MAX = 12 };
+    enum { K8S_PATH_DEPTH = 12 };
     struct {
         int indent;
         char key[64];
-    } stack[PATH_MAX];
+    } stack[K8S_PATH_DEPTH];
     int depth = 0;
     bool got_name = false;
 
@@ -281,7 +281,7 @@ static void k8s_scan_labels(const char *source, k8s_record_t *rec) {
 
                 if (val[0] == '\0') {
                     /* Block-opening key: push onto the path stack. */
-                    if (depth < PATH_MAX) {
+                    if (depth < K8S_PATH_DEPTH) {
                         stack[depth].indent = ind;
                         snprintf(stack[depth].key, sizeof(stack[depth].key), "%s", key);
                         depth++;
