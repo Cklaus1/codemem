@@ -229,7 +229,13 @@ static bool *classify_all_files(
             }
             deleted = tmp;
         }
-        deleted[del_count++] = strdup(stored[i].rel_path);
+        char *rel_copy = strdup(stored[i].rel_path);
+        if (!rel_copy) {
+            cbm_log_error("incremental.err", "msg", "classify_all_files_strdup_oom_del",
+                          "rel_path", stored[i].rel_path);
+            break;
+        }
+        deleted[del_count++] = rel_copy;
     }
 
     cbm_ht_free(ht_stored);
