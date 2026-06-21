@@ -29,6 +29,7 @@
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
 
+#include <ctype.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -63,8 +64,23 @@ static char g_cors_json[512]; /* CORS + Content-Type: application/json */
  * This prevents remote websites from making cross-origin requests to the
  * local graph-ui server (the key defense against CORS-based data exfil). */
 static void update_cors(const cbm_http_req_t *req) {
-    if (req->origin[0] != '\0' && (cbm_http_path_match(req->origin, "http://localhost:*") ||
-                                   cbm_http_path_match(req->origin, "http://127.0.0.1:*"))) {
+    /* Lowercase the hostname portion of the origin before matching so that
+     * "http://LOCALHOST:5173" is treated the same as "http://localhost:5173"
+     * (RFC 7230 §2.7.3: host is case-insensitive). */
+    char origin_lower[512] = {0};
+    const char *orig = req->origin[0] != '\0' ? req->origin : "";
+    strncpy(origin_lower, orig, sizeof(origin_lower) - 1);
+    char *host_start = strstr(origin_lower, "://");
+    if (host_start) {
+        host_start += 3;
+        char *port_or_end = host_start;
+        while (*port_or_end && *port_or_end != ':' && *port_or_end != '/') {
+            *port_or_end = (char)tolower((unsigned char)*port_or_end);
+            port_or_end++;
+        }
+    }
+    if (origin_lower[0] != '\0' && (cbm_http_path_match(origin_lower, "http://localhost:*") ||
+                                    cbm_http_path_match(origin_lower, "http://127.0.0.1:*"))) {
         snprintf(g_cors, sizeof(g_cors),
                  "Access-Control-Allow-Origin: %s\r\n"
                  "Access-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\n"
