@@ -551,11 +551,16 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
     }
     memcpy(vec_copy, vector, (size_t)vector_len);
 
+    char *token_copy = strdup(token);
+    if (!token_copy) {
+        free(vec_copy);
+        return GB_ERR;
+    }
     int idx = gb->dump_token_vec_count;
     gb->dump_token_vecs[idx] = (CBMDumpTokenVec){
         .id = idx + SKIP_ONE, /* 1-based sequential ID */
         .project = gb->project,
-        .token = strdup(token),
+        .token = token_copy,
         .vector = vec_copy,
         .vector_len = vector_len,
         .idf = idf,
