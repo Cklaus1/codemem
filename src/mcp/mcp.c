@@ -67,6 +67,8 @@ enum {
 #include <fcntl.h>
 #endif
 #include <yyjson/yyjson.h>
+#include <ctype.h>
+#include <limits.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,12 +107,27 @@ static char *heap_strdup(const char *s) {
     return d;
 }
 
-/* Write yyjson_mut_doc to heap-allocated JSON string.
- * ALLOW_INVALID_UNICODE: some database strings may contain non-UTF-8 bytes
- * from older indexing runs — don't fail serialization over it. */
+/* Sanitize a string to valid UTF-8, replacing invalid lead bytes with '?'.
+ * dst must be at least dst_sz bytes; result is always NUL-terminated. */
+static void sanitize_utf8(char *dst, size_t dst_sz, const char *src) {
+    size_t i = 0, j = 0;
+    while (src[i] && j + 1 < dst_sz) {
+        unsigned char c = (unsigned char)src[i];
+        if (c < 0x80) {
+            dst[j++] = src[i++]; /* ASCII */
+        } else if (c < 0xC2 || c > 0xF4) {
+            dst[j++] = '?'; i++; /* invalid lead byte */
+        } else {
+            dst[j++] = src[i++]; /* copy multi-byte sequence as-is (simplified) */
+        }
+    }
+    dst[j] = '\0';
+}
+
+/* Write yyjson_mut_doc to heap-allocated JSON string. */
 static char *yy_doc_to_str(yyjson_mut_doc *doc) {
     size_t len = 0;
-    char *s = yyjson_mut_write(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, &len);
+    char *s = yyjson_mut_write(doc, 0, &len);
     return s;
 }
 
@@ -1361,14 +1378,18 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     int emitted = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         yyjson_mut_val *item = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_strcpy(doc, item, "name",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_NAME));
+        char utf8_name[CBM_SZ_512];
+        char utf8_file[CBM_SZ_512];
+        const char *col_name = (const char *)sqlite3_column_text(stmt, BM25_COL_NAME);
+        const char *col_file = (const char *)sqlite3_column_text(stmt, BM25_COL_FILE);
+        sanitize_utf8(utf8_name, sizeof(utf8_name), col_name ? col_name : "");
+        sanitize_utf8(utf8_file, sizeof(utf8_file), col_file ? col_file : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "name", utf8_name);
         yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
                                   (const char *)sqlite3_column_text(stmt, BM25_COL_QN));
         yyjson_mut_obj_add_strcpy(doc, item, "label",
                                   (const char *)sqlite3_column_text(stmt, BM25_COL_LABEL));
-        yyjson_mut_obj_add_strcpy(doc, item, "file_path",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_FILE));
+        yyjson_mut_obj_add_strcpy(doc, item, "file_path", utf8_file);
         yyjson_mut_obj_add_int(doc, item, "start_line", sqlite3_column_int(stmt, BM25_COL_START));
         yyjson_mut_obj_add_int(doc, item, "end_line", sqlite3_column_int(stmt, BM25_COL_END));
         yyjson_mut_obj_add_real(doc, item, "rank", sqlite3_column_double(stmt, BM25_COL_RANK));
@@ -1515,7 +1536,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *query = cbm_mcp_get_string_arg(args, "query");
     if (query && query[0]) {
         int q_limit = cbm_mcp_get_int_arg(args, "limit", BM25_DEFAULT_LIMIT);
+        if (q_limit < 1) q_limit = 1;
+        if (q_limit > MCP_MAX_ROWS) q_limit = MCP_MAX_ROWS;
         int q_offset = cbm_mcp_get_int_arg(args, "offset", 0);
+        if (q_offset < 0) q_offset = 0;
         char *bm25_json = bm25_search(store, project, query, q_limit, q_offset);
         if (bm25_json) {
             free(query);
@@ -1535,7 +1559,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     bool exclude_entry_points = cbm_mcp_get_bool_arg(args, "exclude_entry_points");
     bool include_connected = cbm_mcp_get_bool_arg(args, "include_connected");
     int limit = cbm_mcp_get_int_arg(args, "limit", CBM_DEFAULT_SEARCH_LIMIT);
+    if (limit < 1) limit = 1;
+    if (limit > MCP_MAX_ROWS) limit = MCP_MAX_ROWS;
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
+    if (offset < 0) offset = 0;
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", CBM_NOT_FOUND);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", CBM_NOT_FOUND);
 
@@ -1766,6 +1793,19 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     char *name = cbm_mcp_get_string_arg(args, "project");
     if (!name) {
         return cbm_mcp_text_result("project is required", true);
+    }
+
+    /* Validate project name: only alphanumeric, dash, underscore, dot.
+     * Also reject empty names and names starting with dot (path traversal). */
+    if (name[0] == '.' || name[0] == '\0') {
+        free(name);
+        return cbm_mcp_text_result("invalid project name", true);
+    }
+    for (const char *p = name; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_' && *p != '.') {
+            free(name);
+            return cbm_mcp_text_result("invalid project name", true);
+        }
     }
 
     /* Close store if it's the project being deleted */
@@ -2252,6 +2292,8 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *mode = cbm_mcp_get_string_arg(args, "mode");
     char *param_name = cbm_mcp_get_string_arg(args, "parameter_name");
     int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_DEPTH);
+    if (depth < 1) depth = 1;
+    if (depth > MCP_MAX_DEPTH) depth = MCP_MAX_DEPTH;
     bool risk_labels = cbm_mcp_get_bool_arg(args, "risk_labels");
     bool include_tests = cbm_mcp_get_bool_arg(args, "include_tests");
 
@@ -2608,12 +2650,13 @@ static void build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
-    cbm_normalize_path_sep(repo_path);
 
-    if (!repo_path) {
+    if (!repo_path || repo_path[0] == '\0') {
+        free(repo_path);
         free(mode_str);
         return cbm_mcp_text_result("repo_path is required", true);
     }
+    cbm_normalize_path_sep(repo_path);
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
         free(mode_str);
@@ -2698,8 +2741,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
-    /* Free the pipeline only after the response doc copied the excluded list. */
+    /* Free the pipeline only after the response doc copied the excluded list.
+     * cbm_pipeline_free releases the excluded_dirs strings (owned by the pipeline)
+     * on both success and error paths — no separate free needed. */
     cbm_pipeline_free(p);
+    p = NULL;
+    excluded_dirs = NULL; /* now dangling — clear to prevent accidental use */
     free(project_name);
     free(repo_path);
 
@@ -2805,7 +2852,12 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
     if (!root_path || !file_path) {
         return NULL;
     }
-    size_t apsz = strlen(root_path) + strlen(file_path) + MCP_SEPARATOR;
+    size_t rpath_len = strlen(root_path);
+    size_t file_len = strlen(file_path);
+    if (rpath_len + file_len + 2 > PATH_MAX) {
+        return NULL; /* combined path too long */
+    }
+    size_t apsz = rpath_len + file_len + MCP_SEPARATOR;
     char *abs_path = malloc(apsz);
     snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
 
@@ -2828,7 +2880,44 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
     }
     *out_abs_path = abs_path;
     if (path_ok) {
+#ifdef _WIN32
         return read_file_lines(abs_path, start, end);
+#else
+        /* TOCTOU guard: open with O_NOFOLLOW so a symlink swapped in between
+         * the realpath() check and the open cannot redirect the read. */
+        int fd = open(abs_path, O_RDONLY | O_NOFOLLOW);
+        if (fd < 0) {
+            return NULL;
+        }
+        FILE *f = fdopen(fd, "r");
+        if (!f) {
+            close(fd);
+            return NULL;
+        }
+        /* Read lines start..end from already-open FILE* */
+        size_t cap = CBM_SZ_4K;
+        char *buf = malloc(cap);
+        size_t len = 0;
+        buf[0] = '\0';
+        char fline[CBM_SZ_2K];
+        int lineno = 0;
+        while (fgets(fline, sizeof(fline), f)) {
+            lineno++;
+            if (lineno < start) { continue; }
+            if (lineno > end)   { break; }
+            size_t ll = strlen(fline);
+            while (len + ll + SKIP_ONE > cap) {
+                cap *= PAIR_LEN;
+                buf = safe_realloc(buf, cap);
+            }
+            memcpy(buf + len, fline, ll);
+            len += ll;
+            buf[len] = '\0';
+        }
+        (void)fclose(f);
+        if (len == 0) { free(buf); return NULL; }
+        return buf;
+#endif
     }
     return NULL;
 }
@@ -3652,6 +3741,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *path_filter = cbm_mcp_get_string_arg(args, "path_filter");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     int limit = cbm_mcp_get_int_arg(args, "limit", MCP_DEFAULT_LIMIT);
+    if (limit < 1) limit = 1;
+    if (limit > MCP_MAX_ROWS) limit = MCP_MAX_ROWS;
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
     uint64_t search_t0 = cbm_now_ms();
@@ -3909,6 +4000,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     char *base_branch = cbm_mcp_get_string_arg(args, "base_branch");
     char *scope = cbm_mcp_get_string_arg(args, "scope");
     int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_BFS_DEPTH);
+    if (depth < 1) depth = 1;
+    if (depth > MCP_MAX_DEPTH) depth = MCP_MAX_DEPTH;
 
     /* scope: "files" = just changed files, "symbols" = files + symbols (default) */
     bool want_symbols = !scope || strcmp(scope, "symbols") == 0 || strcmp(scope, "impact") == 0;
@@ -4498,7 +4591,7 @@ static char *inject_update_notice(cbm_mcp_server_t *srv, char *result_json) {
     }
 
     size_t len;
-    char *new_json = yyjson_mut_write(mdoc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, &len);
+    char *new_json = yyjson_mut_write(mdoc, 0, &len);
     yyjson_mut_doc_free(mdoc);
 
     if (new_json) {
