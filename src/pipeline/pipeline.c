@@ -845,10 +845,13 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     cbm_unlink(db_path);
     char wal[PL_WAL_BUF];
     char shm[PL_WAL_BUF];
+    char tmp_stale[PL_WAL_BUF];
     snprintf(wal, sizeof(wal), "%s-wal", db_path);
     snprintf(shm, sizeof(shm), "%s-shm", db_path);
+    snprintf(tmp_stale, sizeof(tmp_stale), "%s.tmp", db_path);
     cbm_unlink(wal);
     cbm_unlink(shm);
+    cbm_unlink(tmp_stale); /* clean up any crash remnant from a prior atomic write */
     free(db_path);
     return CBM_NOT_FOUND;
 }
@@ -886,10 +889,38 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         *last_slash = '\0';
         cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
     }
-    int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
+
+    /* Atomic write: dump to a temp file, then rename to db_path.
+     * This prevents concurrent indexing runs from corrupting the DB by
+     * interleaving a partial write with another run's delete+write window. */
+    char tmp_path[CBM_SZ_4K];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", db_path);
+    int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, tmp_path);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "dump");
+        cbm_unlink(tmp_path);
+        /* Clean up WAL/SHM that SQLite may have created alongside the temp file */
+        char tmp_wal[CBM_SZ_4K];
+        char tmp_shm[CBM_SZ_4K];
+        snprintf(tmp_wal, sizeof(tmp_wal), "%s-wal", tmp_path);
+        snprintf(tmp_shm, sizeof(tmp_shm), "%s-shm", tmp_path);
+        cbm_unlink(tmp_wal);
+        cbm_unlink(tmp_shm);
         return rc;
+    }
+    /* Clean up any WAL/SHM SQLite left alongside the temp file before rename */
+    {
+        char tmp_wal[CBM_SZ_4K];
+        char tmp_shm[CBM_SZ_4K];
+        snprintf(tmp_wal, sizeof(tmp_wal), "%s-wal", tmp_path);
+        snprintf(tmp_shm, sizeof(tmp_shm), "%s-shm", tmp_path);
+        cbm_unlink(tmp_wal);
+        cbm_unlink(tmp_shm);
+    }
+    if (rename(tmp_path, db_path) != 0) {
+        cbm_log_error("pipeline.err", "msg", "rename_failed", "tmp", tmp_path, "dst", db_path);
+        cbm_unlink(tmp_path);
+        return CBM_NOT_FOUND;
     }
     cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
@@ -924,7 +955,12 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
 
     /* Export persistent artifact if enabled */
     if (p->persistence) {
-        cbm_artifact_export(db_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
+        int art_rc = cbm_artifact_export(db_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
+        if (art_rc != 0) {
+            /* Non-fatal: in-memory index succeeded; log so the caller can detect it */
+            cbm_log_warn("pipeline.artifact_export_failed", "db_path", db_path, "rc",
+                         itoa_buf(art_rc));
+        }
     }
 
     return 0;
