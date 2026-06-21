@@ -347,7 +347,17 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory) {
         /* Recover stale WAL from previous crash (best-effort).
          * PASSIVE never blocks readers and never ftruncates.
          * May fail with SQLITE_BUSY if another process holds a lock. */
-        (void)sqlite3_exec(s->db, "PRAGMA wal_checkpoint(PASSIVE)", NULL, NULL, NULL);
+        sqlite3_busy_timeout(s->db, 5000); /* 5 s — prevents hang on corrupt/locked WAL */
+        {
+            char *ckpt_err = NULL;
+            int ckpt_rc = sqlite3_exec(s->db, "PRAGMA wal_checkpoint(PASSIVE)", NULL, NULL,
+                                       &ckpt_err);
+            if (ckpt_rc != SQLITE_OK) {
+                cbm_log_warn("store.wal_checkpoint_failed", "rc",
+                             ckpt_err ? ckpt_err : "unknown", NULL);
+                sqlite3_free(ckpt_err);
+            }
+        }
         rc = exec_sql(s, "PRAGMA synchronous = NORMAL;");
         if (rc != CBM_STORE_OK) {
             return rc;
@@ -1051,7 +1061,24 @@ int64_t cbm_store_upsert_node(cbm_store_t *s, const cbm_node_t *n) {
     bind_text(stmt, ST_COL_5, safe_str(n->file_path));
     sqlite3_bind_int(stmt, ST_COL_6, n->start_line);
     sqlite3_bind_int(stmt, ST_COL_7, n->end_line);
-    bind_text(stmt, ST_COL_8, safe_props(n->properties_json));
+
+    /* Validate properties JSON: if the first non-whitespace character is not
+     * '{' or '[' the string is not valid JSON — substitute an empty object
+     * rather than letting malformed JSON propagate into the database. */
+    const char *props = safe_props(n->properties_json);
+    {
+        const char *p = props;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+            p++;
+        }
+        if (*p != '{' && *p != '[') {
+            cbm_log_warn("store.upsert_node.invalid_json",
+                         "qn", safe_str(n->qualified_name),
+                         "props_preview", props, NULL);
+            props = "{}";
+        }
+    }
+    bind_text(stmt, ST_COL_8, props);
 
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
@@ -1861,6 +1888,12 @@ static int query_neighbor_names(sqlite3 *db, const char *sql, int64_t node_id, i
 
     int cap = ST_INIT_CAP_8;
     char **names = malloc((size_t)cap * sizeof(char *));
+    if (!names) {
+        sqlite3_finalize(stmt);
+        *out = NULL;
+        *out_count = 0;
+        return CBM_NOT_FOUND;
+    }
     int count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char *name = (const char *)sqlite3_column_text(stmt, 0);
@@ -1871,7 +1904,18 @@ static int query_neighbor_names(sqlite3 *db, const char *sql, int64_t node_id, i
             cap *= ST_GROWTH;
             names = safe_realloc(names, (size_t)cap * sizeof(char *));
         }
-        names[count++] = strdup(name);
+        char *duped = strdup(name);
+        if (!duped) {
+            for (int i = 0; i < count; i++) {
+                free(names[i]);
+            }
+            free(names);
+            sqlite3_finalize(stmt);
+            *out = NULL;
+            *out_count = 0;
+            return CBM_NOT_FOUND;
+        }
+        names[count++] = duped;
     }
     sqlite3_finalize(stmt);
     *out = names;
@@ -2507,9 +2551,20 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     int offset = params->offset;
     const char *name_col = has_degree_filter ? "name" : "n.name";
     char order_limit[CBM_SZ_128];
-    snprintf(order_limit, sizeof(order_limit), " ORDER BY %s LIMIT %d OFFSET %d", name_col, limit,
-             offset);
-    strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
+    int ol_len = snprintf(order_limit, sizeof(order_limit), " ORDER BY %s LIMIT %d OFFSET %d",
+                          name_col, limit, offset);
+    if (ol_len < 0 || ol_len >= (int)sizeof(order_limit)) {
+        store_set_error(s, "search: order_limit buffer overflow");
+        like_pool_free(&like_pool);
+        return CBM_STORE_ERR;
+    }
+    size_t sql_remaining = sizeof(sql) - strlen(sql) - 1;
+    if ((size_t)ol_len > sql_remaining) {
+        store_set_error(s, "search: sql buffer too small for ORDER BY clause");
+        like_pool_free(&like_pool);
+        return CBM_STORE_ERR;
+    }
+    strncat(sql, order_limit, sql_remaining);
 
     /* Execute count query */
     sqlite3_stmt *cnt_stmt = NULL;
