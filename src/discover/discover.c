@@ -249,10 +249,18 @@ static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, 
     }
 
     cbm_file_info_t *fi = &fl->files[fl->count++];
-    fi->path = strdup(abs_path);
-    fi->rel_path = strdup(rel_path);
+    char *path_copy = strdup(abs_path);
+    char *rel_copy  = strdup(rel_path);
+    if (!path_copy || !rel_copy) {
+        free(path_copy);
+        free(rel_copy);
+        fl->count--;
+        return;
+    }
+    fi->path     = path_copy;
+    fi->rel_path = rel_copy;
     fi->language = lang;
-    fi->size = size;
+    fi->size     = size;
 }
 
 /* ── Recursive walk ─────────────────────────────── */
