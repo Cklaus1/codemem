@@ -43,6 +43,116 @@ enum {
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
+/* ── Edge type whitelist (Bug #27) ─────────────────────────────── */
+
+static const char *const VALID_EDGE_TYPES[] = {
+    "CALLS",
+    "IMPORTS",
+    "DEFINES",
+    "DEFINES_METHOD",
+    "USAGE",
+    "IMPLEMENTS",
+    "INHERITS",
+    "SIMILAR_TO",
+    "SEMANTICALLY_RELATED",
+    "CONFIGURES",
+    "ASYNC_CALLS",
+    "HTTP_CALLS",
+    "THROWS",
+    "RAISES",
+    "READS",
+    "WRITES",
+    "DECORATES",
+    "TESTS",
+    "TESTS_FILE",
+    "GRPC_CALLS",
+    "GRAPHQL_CALLS",
+    "TRPC_CALLS",
+    "CROSS_HTTP_CALLS",
+    "CROSS_ASYNC_CALLS",
+    "CROSS_GRPC_CALLS",
+    "CROSS_GRAPHQL_CALLS",
+    "CROSS_TRPC_CALLS",
+    "CROSS_CHANNEL",
+    "DATA_FLOWS",
+    NULL};
+
+static bool is_valid_edge_type(const char *t) {
+    for (int i = 0; VALID_EDGE_TYPES[i]; i++) {
+        if (strcmp(t, VALID_EDGE_TYPES[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ── Property name validation (Bug #25) ────────────────────────── */
+
+/* Known direct node properties (struct fields + virtual computed). */
+static const char *const KNOWN_NODE_PROPS[] = {
+    "name",
+    "qualified_name",
+    "label",
+    "file_path",
+    "start_line",
+    "end_line",
+    "in_degree",
+    "out_degree",
+    /* JSON properties_json fields (common extraction metrics) */
+    "complexity",
+    "cognitive",
+    "loop_count",
+    "loop_depth",
+    "transitive_loop_depth",
+    "recursive",
+    "self_recursive",
+    "is_async",
+    "is_exported",
+    "visibility",
+    "language",
+    "signature",
+    "return_type",
+    "docstring",
+    "param_names",
+    "param_types",
+    "decorators",
+    "decorator_tags",
+    "bt",
+    "fp",
+    "type",
+    NULL};
+
+/* Return true if the property name passes a basic sanity check.
+ * Rejects empty strings, names longer than 64 chars, and names containing
+ * characters other than alphanumerics and underscore (which would indicate
+ * SQL injection or a clear typo). */
+static bool is_valid_prop_name(const char *key) {
+    if (!key || key[0] == '\0') {
+        return false;
+    }
+    size_t len = strlen(key);
+    if (len > 64) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        char c = key[i];
+        if (!isalnum((unsigned char)c) && c != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Return true if the property name is in the known whitelist. */
+static bool is_known_node_prop(const char *key) {
+    for (int i = 0; KNOWN_NODE_PROPS[i]; i++) {
+        if (strcmp(key, KNOWN_NODE_PROPS[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static char *heap_strdup(const char *s) {
     if (!s) {
         return NULL;
@@ -492,6 +602,24 @@ static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
             free(arr);
             return CBM_NOT_FOUND;
         }
+        /* Bug #25: reject property names that fail basic sanity (empty, too long,
+         * non-alphanumeric/underscore characters that could indicate SQL injection
+         * or a clear typo). */
+        if (!is_valid_prop_name(key->text)) {
+            snprintf(p->error, sizeof(p->error),
+                     "Unknown property '%s' for node filter", key->text);
+            free(arr);
+            return CBM_NOT_FOUND;
+        }
+        /* Warn (via error path) for unrecognised property names not in the known
+         * whitelist. Properties stored in JSON can extend this set, but names that
+         * look like typos should be surfaced to the caller. */
+        if (!is_known_node_prop(key->text)) {
+            snprintf(p->error, sizeof(p->error),
+                     "Unknown property '%s' for node filter", key->text);
+            free(arr);
+            return CBM_NOT_FOUND;
+        }
         if (!expect(p, TOK_COLON)) {
             free(arr);
             return CBM_NOT_FOUND;
@@ -633,6 +761,12 @@ static int parse_rel_types(parser_t *p, cbm_rel_pattern_t *out) {
         free(types);
         return CBM_NOT_FOUND;
     }
+    /* Bug #27: reject unknown relationship types immediately */
+    if (!is_valid_edge_type(t->text)) {
+        snprintf(p->error, sizeof(p->error), "Unknown relationship type: %s", t->text);
+        free(types);
+        return CBM_NOT_FOUND;
+    }
     const char *first_type = heap_strdup(t->text);
     if (!first_type) {
         free(types);
@@ -643,6 +777,15 @@ static int parse_rel_types(parser_t *p, cbm_rel_pattern_t *out) {
     while (match(p, TOK_PIPE)) {
         t = expect(p, TOK_IDENT);
         if (!t) {
+            for (int i = 0; i < n; i++) {
+                safe_str_free(&types[i]);
+            }
+            free(types);
+            return CBM_NOT_FOUND;
+        }
+        /* Bug #27: reject unknown relationship types in alternation */
+        if (!is_valid_edge_type(t->text)) {
+            snprintf(p->error, sizeof(p->error), "Unknown relationship type: %s", t->text);
             for (int i = 0; i < n; i++) {
                 safe_str_free(&types[i]);
             }
