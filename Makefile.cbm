@@ -410,7 +410,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security libcbm.so libcbm.a
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -576,6 +576,124 @@ cbm-with-ui: embed $(OBJS_VENDORED_PROD)
 		$(wildcard $(BUILD_DIR)/embedded/embed_*.o) \
 		$(LDFLAGS)
 	@echo "Built with UI: $(BUILD_DIR)/codebase-memory-mcp"
+
+# ── Library targets (.so / .a) ────────────────────────────────────
+#
+# Produces libcbm.so (shared) and libcbm.a (static) from the core engine only.
+# Excludes the transport layer: mcp/, cli/, ui/ — those are binary-only.
+#
+# Usage:
+#   make -f Makefile.cbm libcbm.so   # shared library for FFI / dlopen
+#   make -f Makefile.cbm libcbm.a    # static library for direct linking
+#
+# Link consumer binary against libcbm.so:
+#   cc myapp.c -I/path/to/codebase-memory-mcp/src -L build/c -lcbm -lm -lstdc++ -lpthread -lz -o myapp
+#
+# Define CBM_BUILDING_LIBRARY when compiling the library itself so that
+# CBM_PUBLIC expands to visibility("default") / dllexport.
+
+LIB_SRCS = \
+    $(FOUNDATION_SRCS) \
+    $(STORE_SRCS) \
+    $(CYPHER_SRCS) \
+    $(DISCOVER_SRCS) \
+    $(GRAPH_BUFFER_SRCS) \
+    $(PIPELINE_SRCS) \
+    $(SIMHASH_SRCS) \
+    $(SEMANTIC_SRCS) \
+    $(TRACES_SRCS) \
+    $(WATCHER_SRCS) \
+    $(GIT_SRCS) \
+    $(YYJSON_SRC) \
+    src/cbm_library_init.c
+
+CFLAGS_LIB = $(CFLAGS_PROD) -fPIC -DCBM_BUILDING_LIBRARY
+
+# ── Vendored objects recompiled with -fPIC ───────────────────────
+# The production binary doesn't need -fPIC (it's not a shared lib).
+# The library build gets its own set of lib_* objects.
+
+$(BUILD_DIR)/lib_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
+	$(CC) $(MIMALLOC_CFLAGS) -fPIC -c -o $@ $<
+
+$(BUILD_DIR)/lib_sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
+	$(CC) $(SQLITE3_CFLAGS) -fPIC -c -o $@ $<
+
+$(BUILD_DIR)/lib_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS) -fPIC -c -o $@ $<
+
+$(BUILD_DIR)/lib_lsp_all.o: $(CBM_DIR)/lsp_all.c | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS) -fPIC -c -o $@ $<
+
+$(BUILD_DIR)/lib_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_PROD) -fPIC -w -I$(CBM_DIR)/vendored -c -o $@ $<
+
+$(BUILD_DIR)/lib_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -fPIC -I$(CBM_DIR) -c -o $@ $<
+
+$(BUILD_DIR)/lib_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -fPIC -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+
+$(BUILD_DIR)/lib_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -fPIC -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+
+$(BUILD_DIR)/lib_unixcoder.o: $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUILD_DIR)
+	$(CC) -fPIC -c -o $@ $<
+
+# Grammar shim objects with -fPIC (pattern: lib_<grammar>.o from CBM_DIR/<grammar>.c)
+GRAMMAR_OBJS_LIB = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/lib_%.o,$(GRAMMAR_SRCS))
+
+$(BUILD_DIR)/lib_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS) -fPIC -c -o $@ $<
+
+# TRE regex (Windows only)
+TRE_OBJ_LIB :=
+ifeq ($(IS_MINGW),yes)
+TRE_OBJ_LIB = $(BUILD_DIR)/lib_tre.o
+$(BUILD_DIR)/lib_tre.o: $(TRE_SRC) | $(BUILD_DIR)
+	$(CC) $(TRE_CFLAGS) -fPIC -O2 -c -o $@ $<
+endif
+
+OBJS_VENDORED_LIB = \
+    $(BUILD_DIR)/lib_mimalloc.o \
+    $(BUILD_DIR)/lib_sqlite3.o \
+    $(GRAMMAR_OBJS_LIB) \
+    $(BUILD_DIR)/lib_ts_runtime.o \
+    $(BUILD_DIR)/lib_lsp_all.o \
+    $(BUILD_DIR)/lib_preprocessor.o \
+    $(BUILD_DIR)/lib_lz4.o \
+    $(BUILD_DIR)/lib_lz4hc.o \
+    $(BUILD_DIR)/lib_zstd.o \
+    $(BUILD_DIR)/lib_unixcoder.o \
+    $(TRE_OBJ_LIB)
+
+# ── Shared library (.so) ─────────────────────────────────────────
+
+$(BUILD_DIR)/libcbm.so: $(LIB_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_LIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_LIB) -shared -o $@ \
+		$(LIB_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_LIB) \
+		$(LDFLAGS)
+
+libcbm.so: $(BUILD_DIR)/libcbm.so
+	@echo "Built: $(BUILD_DIR)/libcbm.so"
+
+# ── Static library (.a) ──────────────────────────────────────────
+# Uses a partial link (-r) to merge all sources + vendored objects into one
+# relocatable .o, then archives it.  This avoids the need for per-file rules.
+
+$(BUILD_DIR)/libcbm_partial.o: $(LIB_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_LIB) | $(BUILD_DIR)
+	$(CC) -r -nostdlib $(CFLAGS_LIB) -o $@ \
+		$(LIB_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_LIB)
+
+$(BUILD_DIR)/libcbm.a: $(BUILD_DIR)/libcbm_partial.o
+	ar rcs $@ $<
+
+libcbm.a: $(BUILD_DIR)/libcbm.a
+	@echo "Built: $(BUILD_DIR)/libcbm.a"
 
 clean-c:
 	rm -rf $(BUILD_DIR)

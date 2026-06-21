@@ -859,8 +859,11 @@ typedef struct {
 /* Phase 1a: seed the funcs[] / node_ptrs[] arrays from all Function and
  * Method nodes in the graph buffer.  Returns the number of functions collected
  * (0 on OOM), and fills *out_funcs / *out_nodes with newly malloc'd arrays. */
+/* Fix #6: changed_file_set filters nodes to those from changed files.
+ * When NULL (full-index mode), all nodes are included as before. */
 static int phase1_scan_functions(cbm_gbuf_t *gbuf, cbm_sem_func_t **out_funcs,
-                                 const cbm_gbuf_node_t ***out_nodes) {
+                                 const cbm_gbuf_node_t ***out_nodes,
+                                 const CBMHashTable *changed_file_set) {
     *out_funcs = NULL;
     *out_nodes = NULL;
     cbm_sem_func_t *funcs = NULL;
@@ -875,6 +878,9 @@ static int phase1_scan_functions(cbm_gbuf_t *gbuf, cbm_sem_func_t **out_funcs,
             continue;
         }
         for (int i = 0; i < node_count; i++) {
+            if (changed_file_set && !cbm_ht_get(changed_file_set, nodes[i]->file_path)) {
+                continue;
+            }
             if (func_count >= func_cap) {
                 int new_cap = func_cap < MAX_FUNCS_INIT ? MAX_FUNCS_INIT : func_cap * GROW;
                 cbm_sem_func_t *grown = realloc(funcs, (size_t)new_cap * sizeof(cbm_sem_func_t));
@@ -1203,7 +1209,7 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     CBM_PROF_START(t_phase1a);
     cbm_sem_func_t *funcs = NULL;
     const cbm_gbuf_node_t **node_ptrs = NULL;
-    int func_count = phase1_scan_functions(gbuf, &funcs, &node_ptrs);
+    int func_count = phase1_scan_functions(gbuf, &funcs, &node_ptrs, ctx->changed_file_set);
     CBM_PROF_END_N("semantic_edges", "1a_scan_seq", t_phase1a, func_count);
 
     /* Phase 1b: Decode minhash + profile + build api/type/deco vectors (PARALLEL). */

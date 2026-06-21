@@ -9,6 +9,7 @@
  * The buffer frees everything in cbm_gbuf_free().
  */
 #include "foundation/constants.h"
+#include "foundation/compat_thread.h"
 
 enum {
     GB_ERR = -1,
@@ -106,6 +107,11 @@ struct cbm_gbuf {
     CBMDumpTokenVec *dump_token_vecs;
     int dump_token_vec_count;
     int dump_token_vec_cap;
+
+    /* Fix #3: mutex protecting cbm_gbuf_insert_edge so that the two expensive
+     * predump passes (similarity, semantic_edges) can run concurrently without
+     * corrupting the edge hash tables or dedup index. */
+    cbm_mutex_t insert_mu;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -394,6 +400,7 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
     gb->edges_by_type = cbm_ht_create(CBM_SZ_32);
 
     gb->intern_pool = cbm_ht_create(CBM_SZ_1K);
+    cbm_mutex_init(&gb->insert_mu);
 
     return gb;
 }
@@ -482,6 +489,7 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
         cbm_ht_free(gb->intern_pool);
     }
 
+    cbm_mutex_destroy(&gb->insert_mu);
     free(gb->project);
     free(gb->root_path);
     free(gb);
@@ -905,6 +913,10 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
         return 0;
     }
 
+    /* Fix #3: Serialize edge insertion so predump passes can run concurrently.
+     * The lock is uncontended in the common (single-threaded) case. */
+    cbm_mutex_lock(&gb->insert_mu);
+
     /* Check for dedup */
     char key[EDGE_KEY_BUF];
     make_edge_key(key, sizeof(key), source_id, target_id, type);
@@ -916,12 +928,15 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
             free(existing->properties_json);
             existing->properties_json = heap_strdup(properties_json);
         }
-        return existing->id;
+        int64_t eid = existing->id;
+        cbm_mutex_unlock(&gb->insert_mu);
+        return eid;
     }
 
     /* Heap-allocate a new edge (pointer stays stable) */
     cbm_gbuf_edge_t *edge = calloc(CBM_ALLOC_ONE, sizeof(cbm_gbuf_edge_t));
     if (!edge) {
+        cbm_mutex_unlock(&gb->insert_mu);
         return 0;
     }
 
@@ -942,6 +957,7 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
     /* Secondary indexes */
     register_edge_in_indexes(gb, edge);
 
+    cbm_mutex_unlock(&gb->insert_mu);
     return id;
 }
 

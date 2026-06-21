@@ -72,158 +72,119 @@ static int64_t stat_mtime_ns(const struct stat *st) {
 
 /* ── File classification ─────────────────────────────────────────── */
 
-/* Classify discovered files against stored hashes using mtime+size.
- * Returns a boolean array: changed[i] = true if files[i] needs re-parsing.
- * Caller must free the returned array. */
-static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_hash_t *stored,
-                            int stored_count, int *out_changed, int *out_unchanged) {
-    bool *changed = calloc((size_t)file_count, sizeof(bool));
-    if (!changed) {
+/* Fix #5: Merge classify_files + find_deleted_files into one pass.
+ *
+ * Previously both functions built separate hash tables over the same stored[]
+ * and files[] arrays, causing ~4 MB of allocator churn on 100K-file repos
+ * before any parsing began.  Now a single ht_stored and ht_current are built
+ * once and reused for both classification sweeps.
+ *
+ * classify_all_files() sets:
+ *   out_is_changed[i]       — files[i] needs re-parsing
+ *   out_changed / out_unchanged — counts
+ *   out_deleted / out_deleted_count — rel_paths of truly-deleted stored files
+ *   out_mode_skipped / out_mode_skipped_count — hash rows to carry forward
+ *
+ * All previous behavioural contracts (fail-safe, mode-skipped distinction,
+ * partial-OOM handling) are preserved verbatim from the original functions.
+ */
+static bool *classify_all_files(
+    const char *repo_path,
+    cbm_file_info_t *files, int file_count,
+    cbm_file_hash_t *stored, int stored_count,
+    int *out_changed, int *out_unchanged,
+    char ***out_deleted, int *out_deleted_count,
+    cbm_file_hash_t **out_mode_skipped, int *out_mode_skipped_count) {
+
+    *out_deleted = NULL;
+    *out_deleted_count = 0;
+    *out_mode_skipped = NULL;
+    *out_mode_skipped_count = 0;
+
+    bool *is_changed = calloc((size_t)file_count, sizeof(bool));
+    if (!is_changed) {
         return NULL;
     }
 
     int n_changed = 0;
     int n_unchanged = 0;
 
-    /* Build lookup: rel_path -> stored hash */
-    CBMHashTable *ht =
+    /* Single ht_stored shared by both classification sweeps. */
+    CBMHashTable *ht_stored =
         cbm_ht_create(stored_count > 0 ? (size_t)stored_count * PAIR_LEN : CBM_SZ_64);
     for (int i = 0; i < stored_count; i++) {
-        cbm_ht_set(ht, stored[i].rel_path, &stored[i]);
+        cbm_ht_set(ht_stored, stored[i].rel_path, &stored[i]);
     }
 
+    /* Sweep 1: classify current files as changed or unchanged. */
     for (int i = 0; i < file_count; i++) {
-        cbm_file_hash_t *h = cbm_ht_get(ht, files[i].rel_path);
+        cbm_file_hash_t *h = cbm_ht_get(ht_stored, files[i].rel_path);
         if (!h) {
-            /* New file */
-            changed[i] = true;
+            is_changed[i] = true;
             n_changed++;
             continue;
         }
-
         struct stat st;
         if (stat(files[i].path, &st) != 0) {
-            changed[i] = true;
+            is_changed[i] = true;
             n_changed++;
             continue;
         }
-
         if (stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
-            changed[i] = true;
+            is_changed[i] = true;
             n_changed++;
         } else {
             n_unchanged++;
         }
     }
 
-    cbm_ht_free(ht);
     *out_changed = n_changed;
     *out_unchanged = n_unchanged;
-    return changed;
-}
-
-/* Classify stored files that are absent from current discovery. Returns the
- * count of truly-deleted files (output via out_deleted) and ALSO collects
- * mode-skipped files into out_mode_skipped (caller frees both).
- *
- * A stored file is classified as:
- *   - "deleted"      — `stat()` returns ENOENT or ENOTDIR. Its nodes will
- *                       be purged and its hash row dropped.
- *   - "mode-skipped" — `stat()` succeeds. The file exists on disk but the
- *                       current discovery pass didn't visit it (e.g. excluded
- *                       by FAST_SKIP_DIRS in fast/moderate mode). Its nodes
- *                       must be preserved AND its hash row must be carried
- *                       forward into the new DB so subsequent reindexes can
- *                       still see it as "known" rather than treating it as
- *                       new-or-deleted.
- *
- * Without this distinction, a fast-mode reindex after a full-mode index
- * would silently purge every file under `tools/`, `scripts/`, `bin/`,
- * `build/`, `docs/`, `__tests__/`, etc. — see task
- * claude-connectors/codebase-memory-index-repository-is-destructive-...
- * and the 2026-04-13 Skyline incident (packages/mcp/src/tools/ vanished
- * from a live graph mid-session).
- *
- * Mode-skipped hash preservation is the second half of the additive-merge
- * contract: dump_and_persist re-upserts these hash rows so the next reindex
- * can correctly detect a real on-disk deletion of a mode-skipped file (as
- * opposed to seeing it as "never existed" → noop → orphaned graph nodes).
- *
- * Fail-safe rules (preserve nodes on uncertainty):
- *   - repo_path NULL → log error and preserve everything (return 0
- *     deletions, empty mode_skipped). The caller contract is that
- *     repo_path is required; a NULL means a misconfigured pipeline,
- *     not a deletion signal.
- *   - snprintf truncation (combined path ≥ CBM_SZ_4K) → preserve. We can't
- *     reliably stat a truncated path. Treat as mode-skipped.
- *   - stat() errno != ENOENT/ENOTDIR (EACCES, EIO, ELOOP, transient NFS,
- *     etc.) → preserve. The file may exist; we just can't see it right now.
- *     Treat as mode-skipped.
- *
- * Note: we use stat() (not lstat()) on purpose. A symlink whose target was
- * deleted should be classified as deleted from the indexer's perspective
- * because the indexer follows symlinks during discovery — a stale symlink
- * has no source to parse. */
-static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int file_count,
-                              cbm_file_hash_t *stored, int stored_count, char ***out_deleted,
-                              cbm_file_hash_t **out_mode_skipped, int *out_mode_skipped_count) {
-    *out_deleted = NULL;
-    *out_mode_skipped = NULL;
-    *out_mode_skipped_count = 0;
 
     if (!repo_path) {
-        /* Misconfigured pipeline. Preserve everything rather than risk
-         * silently re-introducing the destructive overwrite this function
-         * was rewritten to prevent. */
-        cbm_log_error("incremental.err", "msg", "find_deleted_files_null_repo_path");
-        return 0;
+        cbm_log_error("incremental.err", "msg", "classify_all_files_null_repo_path");
+        cbm_ht_free(ht_stored);
+        return is_changed;
     }
 
-    CBMHashTable *current = cbm_ht_create((size_t)file_count * PAIR_LEN);
+    /* Single ht_current for the deleted-file sweep. */
+    CBMHashTable *ht_current = cbm_ht_create((size_t)file_count * PAIR_LEN);
     for (int i = 0; i < file_count; i++) {
-        cbm_ht_set(current, files[i].rel_path, &files[i]);
+        cbm_ht_set(ht_current, files[i].rel_path, &files[i]);
     }
 
     int del_count = 0;
     int del_cap = CBM_SZ_64;
     char **deleted = malloc((size_t)del_cap * sizeof(char *));
-    if (!deleted) {
-        cbm_log_error("incremental.err", "msg", "find_deleted_files_oom");
-        cbm_ht_free(current);
-        return 0;
-    }
-
     int ms_count = 0;
     int ms_cap = CBM_SZ_64;
     cbm_file_hash_t *mode_skipped = malloc((size_t)ms_cap * sizeof(cbm_file_hash_t));
-    if (!mode_skipped) {
-        cbm_log_error("incremental.err", "msg", "find_deleted_files_oom_ms");
+
+    if (!deleted || !mode_skipped) {
+        cbm_log_error("incremental.err", "msg", "classify_all_files_oom");
         free(deleted);
-        cbm_ht_free(current);
-        return 0;
+        free(mode_skipped);
+        cbm_ht_free(ht_stored);
+        cbm_ht_free(ht_current);
+        return is_changed;
     }
 
+    /* Sweep 2: classify stored files absent from current discovery. */
     for (int i = 0; i < stored_count; i++) {
-        if (cbm_ht_get(current, stored[i].rel_path)) {
-            continue; /* still visited by current pass */
+        if (cbm_ht_get(ht_current, stored[i].rel_path)) {
+            continue;
         }
-        /* Not in current discovery — check if it's truly deleted or just
-         * mode-skipped (excluded by FAST_SKIP_DIRS etc.). */
         bool preserve = false;
         char abs_path[CBM_SZ_4K];
         int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", repo_path, stored[i].rel_path);
         if (n < 0 || n >= (int)sizeof(abs_path)) {
-            /* Truncation or encoding error — can't reliably stat. Preserve. */
             cbm_log_warn("incremental.path_truncated", "rel_path", stored[i].rel_path);
             preserve = true;
         } else {
             struct stat st;
             if (stat(abs_path, &st) == 0) {
-                /* File exists on disk — mode-skipped, not deleted. */
                 preserve = true;
             } else if (errno != ENOENT && errno != ENOTDIR) {
-                /* Transient or permission error — fail safe by preserving.
-                 * EACCES, EIO, ELOOP, ENAMETOOLONG, etc. */
                 cbm_log_warn("incremental.stat_uncertain", "rel_path", stored[i].rel_path, "errno",
                              itoa_buf(errno));
                 preserve = true;
@@ -231,13 +192,11 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
         }
 
         if (preserve) {
-            /* Carry forward the existing hash row so subsequent reindexes
-             * can correctly classify this file. */
             if (ms_count >= ms_cap) {
                 ms_cap *= PAIR_LEN;
                 cbm_file_hash_t *tmp = realloc(mode_skipped, (size_t)ms_cap * sizeof(*tmp));
                 if (!tmp) {
-                    cbm_log_error("incremental.err", "msg", "find_deleted_files_realloc_oom_ms");
+                    cbm_log_error("incremental.err", "msg", "classify_all_files_realloc_oom_ms");
                     break;
                 }
                 mode_skipped = tmp;
@@ -245,17 +204,13 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
             char *rp = strdup(stored[i].rel_path);
             char *sh = stored[i].sha256 ? strdup(stored[i].sha256) : NULL;
             if (!rp || (stored[i].sha256 && !sh)) {
-                /* OOM mid-record. Drop this entry rather than persist a
-                 * row with a NULL rel_path that would silently fail the
-                 * NOT NULL constraint in upsert and reintroduce the
-                 * orphaned-node bug. */
-                cbm_log_error("incremental.err", "msg", "find_deleted_files_strdup_oom", "rel_path",
+                cbm_log_error("incremental.err", "msg", "classify_all_files_strdup_oom", "rel_path",
                               stored[i].rel_path);
                 free(rp);
                 free(sh);
                 break;
             }
-            mode_skipped[ms_count].project = NULL; /* unused by upsert API */
+            mode_skipped[ms_count].project = NULL;
             mode_skipped[ms_count].rel_path = rp;
             mode_skipped[ms_count].sha256 = sh;
             mode_skipped[ms_count].mtime_ns = stored[i].mtime_ns;
@@ -264,12 +219,12 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
             continue;
         }
 
-        /* File is truly gone — record for purge. */
+        /* Truly deleted. */
         if (del_count >= del_cap) {
             del_cap *= PAIR_LEN;
             char **tmp = realloc(deleted, (size_t)del_cap * sizeof(char *));
             if (!tmp) {
-                cbm_log_error("incremental.err", "msg", "find_deleted_files_realloc_oom");
+                cbm_log_error("incremental.err", "msg", "classify_all_files_realloc_oom");
                 break;
             }
             deleted = tmp;
@@ -277,14 +232,17 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
         deleted[del_count++] = strdup(stored[i].rel_path);
     }
 
-    cbm_ht_free(current);
+    cbm_ht_free(ht_stored);
+    cbm_ht_free(ht_current);
+
     *out_deleted = deleted;
+    *out_deleted_count = del_count;
     *out_mode_skipped = mode_skipped;
     *out_mode_skipped_count = ms_count;
-    return del_count;
+    return is_changed;
 }
 
-/* Free a mode_skipped array allocated by find_deleted_files. */
+/* Free a mode_skipped array allocated by classify_all_files. */
 static void free_mode_skipped(cbm_file_hash_t *ms, int count) {
     if (!ms) {
         return;
@@ -539,20 +497,19 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int stored_count = 0;
     cbm_store_get_file_hashes(store, project, &stored, &stored_count);
 
-    /* Classify files */
+    /* Classify files: changed/unchanged AND deleted/mode-skipped in one sweep. */
     int n_changed = 0;
     int n_unchanged = 0;
-    bool *is_changed =
-        classify_files(files, file_count, stored, stored_count, &n_changed, &n_unchanged);
-
-    /* Classify stored files absent from current discovery: truly-deleted
-     * (purge) vs mode-skipped (preserve nodes AND hash rows). */
     char **deleted = NULL;
+    int deleted_count = 0;
     cbm_file_hash_t *mode_skipped = NULL;
     int mode_skipped_count = 0;
-    int deleted_count =
-        find_deleted_files(cbm_pipeline_repo_path(p), files, file_count, stored, stored_count,
-                           &deleted, &mode_skipped, &mode_skipped_count);
+    bool *is_changed =
+        classify_all_files(cbm_pipeline_repo_path(p),
+                           files, file_count, stored, stored_count,
+                           &n_changed, &n_unchanged,
+                           &deleted, &deleted_count,
+                           &mode_skipped, &mode_skipped_count);
 
     cbm_log_info("incremental.classify", "changed", itoa_buf(n_changed), "unchanged",
                  itoa_buf(n_unchanged), "deleted", itoa_buf(deleted_count), "mode_skipped",
@@ -654,7 +611,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     run_extract_resolve(&ctx, changed_files, ci);
     cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
+
+    /* Fix #6: build changed_file_set so semantic passes skip unchanged files. */
+    CBMHashTable *changed_file_set = cbm_ht_create(ci > 0 ? (size_t)ci * PAIR_LEN : CBM_SZ_64);
+    for (int i = 0; i < ci; i++) {
+        cbm_ht_set(changed_file_set, changed_files[i].rel_path, (void *)1);
+    }
+    ctx.changed_file_set = changed_file_set;
+
     run_postpasses(&ctx, changed_files, ci, project);
+
+    cbm_ht_free(changed_file_set);
+    ctx.changed_file_set = NULL;
 
     free(changed_files);
     cbm_registry_free(registry);

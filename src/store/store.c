@@ -2398,12 +2398,20 @@ static int search_where_basic(const cbm_search_params_t *params, char *where, in
 static void search_where_advanced(const cbm_search_params_t *params, char *where, int where_sz,
                                   int *wlen, int *nparams, search_bind_t *binds, int *bind_idx) {
     if (params->relationship) {
+        /* Fix #2: Split the OR into two separate EXISTS so each half can use
+         * idx_edges_source_type / idx_edges_target_type independently.
+         * The OR form (source_id = X OR target_id = X) forces a full edges
+         * table scan; two separate EXISTS allow index seeks.  The parameter is
+         * bound twice — same value, two placeholders. */
+        int idx1 = *bind_idx + SKIP_ONE;
+        int idx2 = *bind_idx + SKIP_ONE + 1;
         char rel_clause[CBM_SZ_256];
         snprintf(rel_clause, sizeof(rel_clause),
-                 "EXISTS(SELECT 1 FROM edges e WHERE "
-                 "(e.source_id = n.id OR e.target_id = n.id) AND e.type = ?%d)",
-                 *bind_idx + SKIP_ONE);
+                 "(EXISTS(SELECT 1 FROM edges e WHERE e.source_id = n.id AND e.type = ?%d)"
+                 " OR EXISTS(SELECT 1 FROM edges e WHERE e.target_id = n.id AND e.type = ?%d))",
+                 idx1, idx2);
         *wlen = where_append(where, where_sz, *wlen, nparams, rel_clause);
+        where_bind_text(binds, bind_idx, params->relationship);
         where_bind_text(binds, bind_idx, params->relationship);
     }
     if (params->exclude_entry_points) {
@@ -2444,12 +2452,27 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     char count_sql[CBM_SZ_4K];
     int bind_idx = 0;
 
-    const char *select_cols = "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-                              "n.file_path, n.start_line, n.end_line, n.properties, "
-                              "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND "
-                              "e.type IN ('CALLS', 'USAGE')) AS in_deg, "
-                              "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND "
-                              "e.type IN ('CALLS', 'USAGE')) AS out_deg ";
+    /* Fix #1: Only compute degree subqueries when the caller needs them for
+     * filtering (min_degree/max_degree).  Firing two correlated COUNT subqueries
+     * per result row when no degree filter is active was an N×2 query overhead
+     * (100 extra queries for a 50-row result set).  in_degree/out_degree in the
+     * result struct are left as 0 for the no-filter path; callers that need
+     * degree counts without filtering should use cbm_store_node_degree(). */
+    bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
+
+    static const char select_cols_no_deg[] =
+        "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+        "n.file_path, n.start_line, n.end_line, n.properties ";
+
+    static const char select_cols_with_deg[] =
+        "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+        "n.file_path, n.start_line, n.end_line, n.properties, "
+        "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND "
+        "e.type IN ('CALLS', 'USAGE')) AS in_deg, "
+        "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND "
+        "e.type IN ('CALLS', 'USAGE')) AS out_deg ";
+
+    const char *select_cols = has_degree_filter ? select_cols_with_deg : select_cols_no_deg;
 
     char where[CBM_SZ_2K] = "";
     search_bind_t binds[ST_SEARCH_MAX_BINDS];
@@ -2465,8 +2488,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         snprintf(sql, sizeof(sql), "%s FROM nodes n", select_cols);
     }
 
-    /* Degree filters */
-    bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
+    /* Degree filter wrapping (has_degree_filter computed above, before select_cols) */
     search_apply_degree_filter(sql, sizeof(sql), params);
 
     /* Count query — stripped of per-row edge subqueries for the common (no-degree-filter)
@@ -2526,8 +2548,11 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         }
         memset(&results[n], 0, sizeof(cbm_search_result_t));
         scan_node(main_stmt, &results[n].node);
-        results[n].in_degree = sqlite3_column_int(main_stmt, ST_COL_9);
-        results[n].out_degree = sqlite3_column_int(main_stmt, CBM_DECIMAL_BASE);
+        /* Degree columns only present when has_degree_filter (see select_cols above). */
+        if (has_degree_filter) {
+            results[n].in_degree = sqlite3_column_int(main_stmt, ST_COL_9);
+            results[n].out_degree = sqlite3_column_int(main_stmt, CBM_DECIMAL_BASE);
+        }
         n++;
     }
 
@@ -2566,18 +2591,33 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
                              int visited_count, const char *types_clause, const char **edge_types,
                              int edge_type_count, cbm_edge_info_t **out_edges,
                              int *out_edge_count) {
-    /* Build ID set: root + all visited */
-    char id_set[CBM_SZ_4K];
-    int ilen = snprintf(id_set, sizeof(id_set), "%lld", (long long)start_id);
-    if (ilen >= (int)sizeof(id_set)) {
-        ilen = (int)sizeof(id_set) - SKIP_ONE;
+    /* Fix #4: Build ID set into a dynamic buffer that grows as needed.
+     * The old fixed CBM_SZ_4K buffer silently truncated the IN clause at ~200
+     * nodes (20 chars/ID), causing bfs_collect_edges to return incomplete edge
+     * sets with no error — a silent data-loss bug on dense graphs. */
+    int id_set_cap = CBM_SZ_4K;
+    char *id_set = malloc((size_t)id_set_cap);
+    if (!id_set) {
+        *out_edges = NULL;
+        *out_edge_count = 0;
+        return CBM_STORE_OK;
     }
+    int ilen = snprintf(id_set, (size_t)id_set_cap, "%lld", (long long)start_id);
     for (int i = 0; i < visited_count; i++) {
-        ilen += snprintf(id_set + ilen, sizeof(id_set) - (size_t)ilen, ",%lld",
-                         (long long)visited[i].node.id);
-        if (ilen >= (int)sizeof(id_set)) {
-            ilen = (int)sizeof(id_set) - SKIP_ONE;
+        /* Each int64 is at most 20 digits + comma + NUL = 22 bytes. */
+        if (ilen + ST_IN_CLAUSE_MARGIN + 20 >= id_set_cap) {
+            id_set_cap += CBM_SZ_4K;
+            char *grown = realloc(id_set, (size_t)id_set_cap);
+            if (!grown) {
+                free(id_set);
+                *out_edges = NULL;
+                *out_edge_count = 0;
+                return CBM_STORE_OK;
+            }
+            id_set = grown;
         }
+        ilen += snprintf(id_set + ilen, (size_t)(id_set_cap - ilen), ",%lld",
+                         (long long)visited[i].node.id);
     }
 
     char edge_sql[ST_SQL_BUF];
@@ -2593,10 +2633,12 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
     sqlite3_stmt *estmt = NULL;
     int rc = sqlite3_prepare_v2(s->db, edge_sql, CBM_NOT_FOUND, &estmt, NULL);
     if (rc != SQLITE_OK) {
+        free(id_set);
         *out_edges = NULL;
         *out_edge_count = 0;
         return CBM_STORE_OK;
     }
+    free(id_set); /* SQL string is already compiled into the prepared statement */
 
     if (edge_type_count > 0) {
         for (int i = 0; i < edge_type_count; i++) {

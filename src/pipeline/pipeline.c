@@ -513,29 +513,83 @@ static void predump_complexity(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_complexity(ctx);
 }
 
+/* Fix #3: Thread wrapper so predump_sim / predump_sem can run concurrently.
+ * Both passes use internal deferred-edge buffers that merge into gbuf only at
+ * the end; cbm_gbuf_insert_edge is now mutex-protected, so concurrent merges
+ * are safe.  See graph_buffer.c:insert_mu. */
+typedef struct {
+    predump_pass_fn fn;
+    cbm_pipeline_ctx_t *ctx;
+    const char *name;
+    long elapsed_ms_out;
+} predump_thread_arg_t;
+
+static void *predump_thread_fn(void *arg) {
+    predump_thread_arg_t *a = (predump_thread_arg_t *)arg;
+    struct timespec t;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    a->fn(a->ctx);
+    a->elapsed_ms_out = (long)elapsed_ms(t);
+    return NULL;
+}
+
 static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
+    struct timespec t;
+
+    /* Group 1 — fast sequential passes (complete in seconds, write to gbuf
+     * directly; no concurrent writes, no ordering dependency). */
     static const struct {
         predump_pass_fn fn;
         const char *name;
-        bool moderate_only; /* true = skip in fast mode */
-    } passes[] = {
-        {predump_deco, "decorator_tags", false}, {predump_cfg, "configlink", false},
-        {predump_route, "route_match", false},   {predump_sim, "similarity", true},
-        {predump_sem, "semantic_edges", true},   {predump_complexity, "complexity", false},
+    } seq_passes[] = {
+        {predump_deco, "decorator_tags"},
+        {predump_cfg, "configlink"},
+        {predump_route, "route_match"},
+        {predump_complexity, "complexity"},
     };
-    enum { PREDUMP_PASS_COUNT = 6 };
-    struct timespec t;
-    for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
-        /* "moderate_only" passes (similarity/semantic edges) run in FULL,
-         * MODERATE and ADVANCED — they are skipped only in FAST. Compare
-         * explicitly against FAST rather than `> MODERATE` so ADVANCED
-         * (numerically 3) is not mistaken for a lighter mode than FULL. */
-        if (passes[i].moderate_only && p->mode == CBM_MODE_FAST) {
-            continue;
-        }
+    enum { SEQ_PASS_COUNT = 4 };
+    for (int i = 0; i < SEQ_PASS_COUNT && !check_cancel(p); i++) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-        passes[i].fn(ctx);
-        cbm_log_info("pass.timing", "pass", passes[i].name, "elapsed_ms",
+        seq_passes[i].fn(ctx);
+        cbm_log_info("pass.timing", "pass", seq_passes[i].name, "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+    }
+
+    /* Group 2 — expensive passes skipped in fast mode.  Run concurrently:
+     * similarity and semantic_edges are mutually independent (different edge
+     * types, both use deferred-edge buffers).  cbm_gbuf_insert_edge serializes
+     * the final edge merge so there is no data race on the graph buffer. */
+    if (p->mode == CBM_MODE_FAST || check_cancel(p)) {
+        return;
+    }
+
+    predump_thread_arg_t arg_sim = {predump_sim, ctx, "similarity", 0};
+    predump_thread_arg_t arg_sem = {predump_sem, ctx, "semantic_edges", 0};
+
+    cbm_thread_t t_sim, t_sem;
+    bool sim_ok = (cbm_thread_create(&t_sim, 0, predump_thread_fn, &arg_sim) == 0);
+    bool sem_ok = (cbm_thread_create(&t_sem, 0, predump_thread_fn, &arg_sem) == 0);
+
+    if (sim_ok) {
+        cbm_thread_join(&t_sim);
+        cbm_log_info("pass.timing", "pass", "similarity", "elapsed_ms",
+                     itoa_buf((int)arg_sim.elapsed_ms_out));
+    } else {
+        /* Thread creation failed — fall back to sequential. */
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        predump_sim(ctx);
+        cbm_log_info("pass.timing", "pass", "similarity", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+    }
+
+    if (sem_ok) {
+        cbm_thread_join(&t_sem);
+        cbm_log_info("pass.timing", "pass", "semantic_edges", "elapsed_ms",
+                     itoa_buf((int)arg_sem.elapsed_ms_out));
+    } else {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        predump_sem(ctx);
+        cbm_log_info("pass.timing", "pass", "semantic_edges", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
     }
 }

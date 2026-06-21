@@ -69,6 +69,13 @@ typedef struct {
      * configs are an easy follow-on). NULL when no usable configs were found.
      * Owned by pipeline.c / pipeline_incremental.c. */
     const cbm_path_alias_collection_t *path_aliases;
+
+    /* Fix #6: rel_path → (void*)1 for every file that changed this run.
+     * Non-NULL only in incremental mode. Expensive per-node passes (semantic
+     * edges) skip nodes whose file_path is absent from this set, avoiding
+     * full re-embedding on every incremental reindex. NULL in full-index mode
+     * (all nodes must be processed). Owned by pipeline_incremental.c. */
+    const CBMHashTable *changed_file_set;
 } cbm_pipeline_ctx_t;
 
 /* Get the current pipeline's package map (NULL if none). */
